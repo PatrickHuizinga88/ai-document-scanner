@@ -1,0 +1,25 @@
+{
+  "name": "ai-doc-scanner",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^2.0.42",
+    "@ai-sdk/vue": "^2.0.60",
+    "@nuxtjs/supabase": "2.0.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "ai": "^5.0.60",
+    "nuxt": "^4.1.2",
+    "shadcn-nuxt": "2.3.1",
+    "tailwindcss": "^4.1.14",
+    "vue": "^3.5.22",
+    "vue-router": "^4.5.1",
+    "zod": "^4.1.12"
+  }
+}
