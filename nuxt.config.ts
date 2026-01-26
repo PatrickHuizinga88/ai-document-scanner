@@ -1,17 +1,18 @@
-import {defineNuxtConfig} from "nuxt/config";
+import { defineNuxtConfig } from "nuxt/config";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineNuxtConfig({
-  compatibilityDate: '2025-07-15',
+  compatibilityDate: "2025-07-15",
   devtools: { enabled: true },
   vite: {
-    plugins: [
-      tailwindcss()
-    ]
+    plugins: [tailwindcss()],
   },
-  css: ['./app/assets/css/main.css'],
-  modules: ['shadcn-nuxt', '@nuxtjs/supabase'],
+  css: ["./app/assets/css/main.css"],
+  modules: ["shadcn-nuxt", "@nuxtjs/supabase"],
   runtimeConfig: {
-    openaiApiKey: '',
-  }
-})
+    openaiApiKey: "",
+  },
+  supabase: {
+    redirect: false,
+  },
+});
