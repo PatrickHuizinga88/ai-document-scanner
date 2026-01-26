@@ -1,17 +1,17 @@
-import { generateObject, generateText } from "ai";
+import { generateObject } from "ai";
 import { z } from "zod";
 import { createOpenAI } from "@ai-sdk/openai";
+import type { TemplateField, ScanRequest } from "~~/types/template";
 
-// Helper voor robuuste number parsing (model geeft soms strings terug)
-const numberSchema = z.preprocess((val) => {
-  if (val === null || val === undefined || val === "") return undefined;
-  if (typeof val === "number") return val;
-  if (typeof val === "string") {
-    const parsed = parseFloat(val.replace(/[^\d.-]/g, ""));
-    return isNaN(parsed) ? undefined : parsed;
-  }
-  return undefined;
-}, z.number().optional());
+// const numberSchema = z.preprocess((val) => {
+//   if (val === null || val === undefined || val === "") return undefined;
+//   if (typeof val === "number") return val;
+//   if (typeof val === "string") {
+//     const parsed = parseFloat(val.replace(/[^\d.-]/g, ""));
+//     return isNaN(parsed) ? undefined : parsed;
+//   }
+//   return undefined;
+// }, z.number().optional());
 
 const { openaiApiKey } = useRuntimeConfig();
 
@@ -19,97 +19,96 @@ const openai = createOpenAI({
   apiKey: openaiApiKey,
 });
 
-const invoiceSchema = z.object({
-  success: z.boolean().describe("Whether the document was successfully parsed"),
-  documentType: z
-    .string()
-    .describe("Type of document (invoice, receipt, contract, etc.)"),
-  invoiceNumber: z
-    .string()
-    .optional()
-    .nullable()
-    .describe("Invoice or document number"),
-  date: z.string().optional().nullable().describe("Invoice or document date"),
-  dueDate: z
-    .string()
-    .optional()
-    .nullable()
-    .describe("Payment due date if applicable"),
-  vendor: z
-    .object({
-      name: z.string().optional().nullable(),
-      address: z.string().optional().nullable(),
-      email: z.string().optional().nullable(),
-      phone: z.string().optional().nullable(),
-      taxId: z
-        .string()
-        .optional()
-        .nullable()
-        .describe("VAT or tax identification number"),
-    })
-    .optional()
-    .nullable(),
-  customer: z
-    .object({
-      name: z.string().optional().nullable(),
-      address: z.string().optional().nullable(),
-    })
-    .optional()
-    .nullable(),
-  items: z
-    .array(
-      z.object({
-        description: z.string(),
-        quantity: numberSchema,
-        unitPrice: numberSchema,
-        total: numberSchema,
-      }),
-    )
-    .optional()
-    .nullable()
-    .describe("Line items from the document"),
-  subtotal: numberSchema,
-  tax: numberSchema,
-  total: numberSchema,
-  currency: z
-    .string()
-    .optional()
-    .nullable()
-    .describe("Currency code (EUR, USD, etc.)"),
-  paymentDetails: z
-    .object({
-      iban: z.string().optional().nullable(),
-      bankName: z.string().optional().nullable(),
-    })
-    .optional()
-    .nullable(),
-});
+const buildDynamicSchema = (fields: TemplateField[]) => {
+  const schemaShape: Record<string, z.ZodTypeAny> = {
+    success: z.boolean().describe("Whether the document was successfully parsed"),
+  };
+
+  for (const field of fields) {
+    let fieldSchema: z.ZodTypeAny;
+
+    switch (field.type) {
+      case "text":
+        fieldSchema = z.string().describe(field.description);
+        break;
+      case "number":
+        // fieldSchema = numberSchema.describe(field.description);
+        fieldSchema = z.number().describe(field.description);
+        break;
+      case "date":
+        fieldSchema = z
+          .string()
+          .describe(`${field.description} (ISO date format or original format from document)`);
+        break;
+      case "boolean":
+        fieldSchema = z.boolean().describe(field.description);
+        break;
+      case "array":
+        fieldSchema = z.array(z.string()).describe(field.description);
+        break;
+      default:
+        fieldSchema = z.string().describe(field.description);
+    }
+
+    // if (!field.required) {
+    //   fieldSchema = fieldSchema.optional().nullable();
+    // }
+
+    schemaShape[field.name] = fieldSchema;
+  }
+
+  return z.object(schemaShape);
+};
+
+const buildSystemPrompt = (fields: TemplateField[]): string => {
+  const fieldDescriptions = fields
+    .map((f) => `- ${f.label} (${f.name}): ${f.description}${f.required ? " [REQUIRED]" : ""}`)
+    .join("\n");
+
+  return `You are a document scanning assistant. Extract the following information from the provided document:
+
+${fieldDescriptions}
+
+Instructions:
+- Extract values exactly as they appear in the document when appropriate
+- For dates, preserve the original format or use ISO format (YYYY-MM-DD)
+- For numbers, extract the numeric value only
+- For arrays, extract all relevant items as a list
+- For booleans, determine true/false based on the document content
+- Set success to true if you could extract at least some of the requested fields
+- Set success to false only if the document is unreadable or completely irrelevant`;
+};
 
 export default eventHandler(async (event) => {
-  const { documentUrl, documentType, debug } = await readBody(event);
+  const body = await readBody<ScanRequest>(event);
+  const { documentUrl, documentType, fields } = body;
 
   if (!documentUrl || !documentType) {
     return { error: "Geen document of document type opgegeven" };
+  }
+
+  if (!fields || fields.length === 0) {
+    return { error: "Geen velden opgegeven" };
   }
 
   const fileResponse = await fetch(documentUrl);
   const fileBuffer = await fileResponse.arrayBuffer();
   const base64Data = Buffer.from(fileBuffer).toString("base64");
 
+  const dynamicSchema = buildDynamicSchema(fields);
+  const systemPrompt = buildSystemPrompt(fields);
+
   const messages = [
     {
       role: "system" as const,
-      content: `You are a document scanning assistant. Extract all relevant information from the provided document image.
-      Focus on invoices, receipts, and financial documents.
-      Extract dates, amounts, vendor details, line items, and payment information.
-      Return structured data according to the schema. Set success to false if the document cannot be parsed.`,
+      content: systemPrompt,
     },
     {
       role: "user" as const,
       content: [
         {
           type: "text" as const,
-          text: `Please scan this document and extract all relevant information including vendor details, amounts, dates, and line items. Return valid JSON only.`,
+          text: "Please scan this document and extract the requested information. Return valid JSON only.",
         },
         {
           type: "file" as const,
@@ -122,62 +121,16 @@ export default eventHandler(async (event) => {
 
   try {
     const { object: response } = await generateObject({
-      model: openai("gpt-4o-mini"),
-      schemaName: "documentContent",
-      schemaDescription: "Structured data extracted from a document",
-      schema: invoiceSchema,
+      model: openai("gpt-5-mini"),
+      schemaName: "extractedData",
+      schemaDescription: "Structured data extracted from a document based on user-defined template",
+      schema: dynamicSchema,
       messages,
     });
 
-    if (!response || !response.success) {
-      throw new Error("Document kon niet worden gescand");
-    }
-
     return response;
   } catch (error) {
-    // Debug mode: haal ruwe response op om te zien wat het model teruggeeft
-    if (debug) {
-      try {
-        const { text: rawResponse } = await generateText({
-          model: openai("gpt-4o-mini"),
-          messages: [
-            ...messages,
-            {
-              role: "user" as const,
-              content:
-                "Return the extracted data as a JSON object with these fields: success (boolean), documentType (string), invoiceNumber, date, dueDate, vendor (object with name, address, email, phone, taxId), customer (object with name, address), items (array of objects with description, quantity, unitPrice, total), subtotal, tax, total, currency, paymentDetails (object with iban, bankName).",
-            },
-          ],
-        });
-
-        // Probeer de ruwe response te parsen
-        let parsedRaw = null;
-        try {
-          // Zoek JSON in de response
-          const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            parsedRaw = JSON.parse(jsonMatch[0]);
-          }
-        } catch {
-          // Parse failed, geef ruwe tekst terug
-        }
-
-        return {
-          error: error.message,
-          debug: {
-            rawResponse,
-            parsedRaw,
-            validationError: error.cause || error.message,
-          },
-        };
-      } catch (debugError) {
-        return {
-          error: error.message,
-          debugError: debugError.message,
-        };
-      }
-    }
-
-    return { error: error.message };
+    const errorMessage = error instanceof Error ? error.message : "Onbekende fout";
+    return { error: errorMessage, success: false };
   }
 });

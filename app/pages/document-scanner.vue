@@ -1,10 +1,34 @@
 <script setup lang="ts">
+import { CloudUpload, Code, Check, Pencil } from "lucide-vue-next";
+import type { ExtractionTemplate, TemplateField, ScanResult } from "~/types/template";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
+import TemplateSelector from "@/components/templates/TemplateSelector.vue";
+import TemplateEditor from "@/components/templates/TemplateEditor.vue";
+import ScanResultField from "@/components/scanner/ScanResultField.vue";
+import CopyButton from "@/components/scanner/CopyButton.vue";
+
 const supabase = useSupabaseClient();
-const fileInput = ref(null);
+const route = useRoute();
+
+const fileInput = ref<HTMLInputElement | null>(null);
 const isDragging = ref(false);
 const loading = ref(false);
-const result = ref(null);
-const error = ref(null);
+const result = ref<ScanResult | null>(null);
+const error = ref<string | null>(null);
+
+const selectedTemplateId = ref<string | null>((route.query.template as string) || null);
+const showEditorDialog = ref(false);
+const editingTemplate = ref<ExtractionTemplate | null>(null);
+const savingTemplate = ref(false);
+
+const showRawJson = ref(false);
 
 const ACCEPTED_FILE_TYPES = {
   "application/pdf": [".pdf"],
@@ -14,16 +38,116 @@ const ACCEPTED_FILE_TYPES = {
   "image/tiff": [".tiff", ".tif"],
 };
 
-const handleFileSelect = async (event) => {
-  const file = event.target.files?.[0];
+const { data: templates, status } = useLazyAsyncData(
+  "scanner-templates",
+  async () => {
+    const { data, error: fetchError } = await supabase
+      .from("extraction_templates")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (fetchError) throw fetchError;
+    return data as ExtractionTemplate[];
+  },
+  { default: () => [] },
+);
+
+const currentTemplate = computed(() => {
+  if (!selectedTemplateId.value) return null;
+  return templates.value.find((t) => t.id === selectedTemplateId.value) || null;
+});
+
+watch(selectedTemplateId, () => {
+  result.value = null;
+  error.value = null;
+});
+
+const openCreateDialog = () => {
+  editingTemplate.value = null;
+  showEditorDialog.value = true;
+};
+
+const openEditDialog = () => {
+  if (currentTemplate.value) {
+    editingTemplate.value = currentTemplate.value;
+    showEditorDialog.value = true;
+  }
+};
+
+const closeEditorDialog = () => {
+  showEditorDialog.value = false;
+  editingTemplate.value = null;
+};
+
+const handleSaveTemplate = async (data: {
+  name: string;
+  description: string;
+  fields: TemplateField[];
+}) => {
+  savingTemplate.value = true;
+  try {
+    const fieldsWithIds: TemplateField[] = data.fields.map((field, index) => ({
+      ...field,
+      id: field.id || crypto.randomUUID(),
+    }));
+
+    if (editingTemplate.value) {
+      const { data: updated, error: updateError } = await supabase
+        .from("extraction_templates")
+        .update({
+          name: data.name,
+          description: data.description || null,
+          fields: fieldsWithIds,
+        })
+        .eq("id", editingTemplate.value.id)
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
+
+      const index = templates.value.findIndex((t) => t.id === updated.id);
+      if (index !== -1) {
+        templates.value[index] = updated as ExtractionTemplate;
+      }
+    } else {
+      const { data: created, error: createError } = await supabase
+        .from("extraction_templates")
+        .insert({
+          name: data.name,
+          description: data.description || null,
+          fields: fieldsWithIds,
+        })
+        .select()
+        .single();
+
+      if (createError) throw createError;
+
+      templates.value.unshift(created as ExtractionTemplate);
+      selectedTemplateId.value = created.id;
+    }
+    closeEditorDialog();
+  } catch (err) {
+    console.error("Failed to save template:", err);
+  } finally {
+    savingTemplate.value = false;
+  }
+};
+
+const isValidFileType = (type: string) => {
+  return Object.keys(ACCEPTED_FILE_TYPES).includes(type);
+};
+
+const handleFileSelect = async (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  const file = target.files?.[0];
   if (file) {
     await scanDocument(file);
   }
 };
 
-const handleDrop = async (event) => {
+const handleDrop = async (event: DragEvent) => {
   isDragging.value = false;
-  const file = event.dataTransfer.files?.[0];
+  const file = event.dataTransfer?.files?.[0];
 
   if (file && isValidFileType(file.type)) {
     await scanDocument(file);
@@ -32,17 +156,17 @@ const handleDrop = async (event) => {
   }
 };
 
-const isValidFileType = (type) => {
-  return Object.keys(ACCEPTED_FILE_TYPES).includes(type);
-};
+const scanDocument = async (file: File) => {
+  if (!currentTemplate.value) {
+    error.value = "Selecteer eerst een template";
+    return;
+  }
 
-const scanDocument = async (file) => {
   loading.value = true;
   error.value = null;
   result.value = null;
 
   try {
-    // Upload file to Supabase Storage
     const fileName = `${Date.now()}-${file.name}`;
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from("documents")
@@ -53,76 +177,112 @@ const scanDocument = async (file) => {
 
     if (uploadError) throw uploadError;
 
-    // Get signed URL (expires in 5 minutes)
-    const { data: signedUrlData, error: signedUrlError } =
-      await supabase.storage
-        .from("documents")
-        .createSignedUrl(uploadData.path, 300);
+    const { data: signedUrlData, error: signedUrlError } = await supabase.storage
+      .from("documents")
+      .createSignedUrl(uploadData.path, 300);
 
     if (signedUrlError) throw signedUrlError;
 
-    // Send to API endpoint
-    const response = await $fetch("/api/scan-document", {
+    const response = await $fetch<ScanResult>("/api/scan-document", {
       method: "POST",
       body: {
         documentUrl: signedUrlData.signedUrl,
         documentType: file.type,
+        fields: currentTemplate.value.fields,
       },
     });
 
-    if (response.error) {
-      error.value = response.error;
+    if ("error" in response && response.error) {
+      error.value = response.error as string;
     } else {
       result.value = response;
     }
 
-    // Optional: Delete the file after processing
-    // await supabase.storage
-    //     .from('documents')
-    //     .remove([uploadData.path])
+    await supabase.storage.from("documents").remove([uploadData.path]);
   } catch (err) {
     error.value =
-      err.message || "Document scannen mislukt. Probeer het opnieuw.";
+      err instanceof Error ? err.message : "Document scannen mislukt. Probeer het opnieuw.";
   } finally {
     loading.value = false;
   }
 };
 
-const formatCurrency = (amount) => {
-  if (!amount && amount !== 0) return "-";
-  return new Intl.NumberFormat("nl-NL", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amount);
-};
-
 const reset = () => {
   result.value = null;
   error.value = null;
+  showRawJson.value = false;
   if (fileInput.value) {
     fileInput.value.value = "";
   }
 };
+
+const rawJsonString = computed(() => {
+  if (!result.value) return "";
+  return JSON.stringify(result.value, null, 2);
+});
+
+const resultFields = computed(() => {
+  if (!result.value || !currentTemplate.value) return [];
+  return currentTemplate.value.fields.map((field) => ({
+    ...field,
+    value: result.value?.[field.name],
+  }));
+});
 </script>
 
 <template>
   <div class="p-8">
     <div class="mx-auto max-w-4xl">
-      <div class="mb-8 text-center">
-        <h1 class="text-3xl font-bold text-slate-900">Document Scanner</h1>
-        <p class="mt-2 text-slate-600">
-          Upload een document om gestructureerde informatie te extraheren
+      <div class="mb-8">
+        <h1 class="text-3xl font-bold text-foreground">Document Scanner</h1>
+        <p class="mt-1 text-muted-foreground">
+          Selecteer een template en upload een document om gegevens te extraheren
         </p>
+      </div>
+
+      <!-- Template Selection -->
+      <div class="mb-6 rounded-xl bg-card p-4">
+        <div class="flex items-center gap-3">
+          <div class="flex-1">
+            <label class="mb-1.5 block text-sm font-medium text-foreground">Template</label>
+            <TemplateSelector
+              v-model="selectedTemplateId"
+              :templates="templates"
+              @create-new="openCreateDialog"
+            />
+          </div>
+          <Button v-if="currentTemplate" variant="outline" class="mt-6" @click="openEditDialog">
+            <Pencil class="h-4 w-4" />
+            Bewerken
+          </Button>
+        </div>
+
+        <!-- Template Fields Preview -->
+        <div v-if="currentTemplate && !result" class="mt-4 border-t border-border pt-4">
+          <p class="mb-2 text-sm font-medium text-muted-foreground">
+            Velden die worden geëxtraheerd:
+          </p>
+          <div class="flex flex-wrap gap-2">
+            <span
+              v-for="field in currentTemplate.fields"
+              :key="field.id"
+              class="inline-flex items-center gap-1 rounded-full bg-muted px-3 py-1 text-sm text-muted-foreground"
+            >
+              {{ field.label }}
+              <span v-if="field.required" class="text-destructive">*</span>
+            </span>
+          </div>
+        </div>
       </div>
 
       <!-- Upload Area -->
       <div
-        v-if="!result && !loading"
-        class="relative rounded-2xl border-2 border-dashed border-slate-300 bg-white p-12 text-center transition-all hover:border-slate-400"
+        v-if="currentTemplate && !result && !loading"
+        class="relative rounded-xl border-2 border-dashed border-border bg-card p-12 text-center transition-all hover:border-muted-foreground"
+        :class="{ 'border-primary bg-accent': isDragging }"
         @dragover.prevent="isDragging = true"
         @dragleave.prevent="isDragging = false"
         @drop.prevent="handleDrop"
-        :class="{ 'border-blue-400 bg-blue-50': isDragging }"
       >
         <input
           ref="fileInput"
@@ -132,275 +292,98 @@ const reset = () => {
           @change="handleFileSelect"
         />
 
-        <div
-          class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-slate-100"
-        >
-          <svg
-            class="h-8 w-8 text-slate-400"
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-            />
-          </svg>
+        <div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
+          <CloudUpload class="h-8 w-8 text-muted-foreground" />
         </div>
 
-        <p class="mb-2 text-lg font-medium text-slate-700">
+        <p class="mb-2 text-lg font-medium text-card-foreground">
           Sleep je document hierheen of
-          <button
-            @click="$refs.fileInput.click()"
-            class="text-blue-600 hover:text-blue-700"
-          >
+          <button @click="fileInput?.click()" class="text-primary hover:text-primary/80">
             blader
           </button>
         </p>
-        <p class="text-sm text-slate-500">
-          PDF, JPG, PNG, WEBP of TIFF bestanden
+        <p class="text-sm text-muted-foreground">PDF, JPG, PNG, WEBP of TIFF bestanden</p>
+      </div>
+
+      <!-- No Template Selected -->
+      <div
+        v-else-if="!currentTemplate && !loading"
+        class="rounded-xl border border-dashed border-border bg-card p-12 text-center"
+      >
+        <p class="text-muted-foreground">
+          Selecteer een template hierboven of
+          <button class="text-primary hover:text-primary/80" @click="openCreateDialog">
+            maak een nieuw template
+          </button>
         </p>
       </div>
 
       <!-- Loading State -->
-      <div v-if="loading" class="rounded-2xl bg-white p-12 text-center">
+      <div v-if="loading" class="rounded-xl bg-card p-12 text-center">
         <div
-          class="mx-auto mb-4 h-12 w-12 animate-spin rounded-full border-4 border-slate-200 border-t-blue-600"
+          class="mx-auto mb-4 h-12 w-12 animate-spin rounded-full border-4 border-muted border-t-primary"
         ></div>
-        <p class="text-lg font-medium text-slate-700">
-          Document wordt gescand...
-        </p>
-        <p class="mt-1 text-sm text-slate-500">Dit kan even duren</p>
+        <p class="text-lg font-medium text-card-foreground">Document wordt gescand...</p>
+        <p class="mt-1 text-sm text-muted-foreground">Dit kan even duren</p>
       </div>
 
       <!-- Results -->
       <div v-if="result && !loading" class="space-y-4">
-        <div class="flex items-center justify-between rounded-xl bg-white p-4">
+        <div class="flex items-center justify-between rounded-lg bg-card p-4">
           <div class="flex items-center gap-3">
-            <div
-              class="flex h-10 w-10 items-center justify-center rounded-full bg-green-100"
-            >
-              <svg
-                class="h-5 w-5 text-green-600"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
+            <div class="flex h-10 w-10 items-center justify-center rounded-full bg-chart-2/20">
+              <Check class="h-5 w-5 text-chart-2" />
             </div>
             <div>
-              <p class="font-medium text-slate-900">Scan Voltooid</p>
-              <p class="text-sm text-slate-500">
-                {{ result.documentType || "Document" }}
+              <p class="font-medium text-card-foreground">Scan Voltooid</p>
+              <p class="text-sm text-muted-foreground">
+                {{ currentTemplate?.name }}
               </p>
             </div>
           </div>
-          <button
-            @click="reset"
-            class="rounded-lg bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-200"
-          >
-            Nieuw Document Scannen
-          </button>
+          <div class="flex items-center gap-2">
+            <Button variant="outline" size="sm" @click="showRawJson = !showRawJson">
+              <Code class="h-4 w-4" />
+              {{ showRawJson ? "Verberg" : "Toon" }} JSON
+            </Button>
+            <Button variant="secondary" size="sm" @click="reset"> Nieuw document scannen </Button>
+          </div>
         </div>
 
-        <div class="rounded-2xl bg-white p-6 shadow-sm">
-          <h2 class="mb-4 text-xl font-semibold text-slate-900">
-            Geëxtraheerde Informatie
-          </h2>
-
-          <!-- Document Details -->
-          <div
-            v-if="result.invoiceNumber || result.date || result.dueDate"
-            class="mb-6 grid gap-4 sm:grid-cols-3"
-          >
-            <div v-if="result.invoiceNumber" class="rounded-lg bg-slate-50 p-4">
-              <p class="text-sm text-slate-500">Documentnummer</p>
-              <p class="mt-1 font-medium text-slate-900">
-                {{ result.invoiceNumber }}
-              </p>
-            </div>
-            <div v-if="result.date" class="rounded-lg bg-slate-50 p-4">
-              <p class="text-sm text-slate-500">Datum</p>
-              <p class="mt-1 font-medium text-slate-900">{{ result.date }}</p>
-            </div>
-            <div v-if="result.dueDate" class="rounded-lg bg-slate-50 p-4">
-              <p class="text-sm text-slate-500">Vervaldatum</p>
-              <p class="mt-1 font-medium text-slate-900">
-                {{ result.dueDate }}
-              </p>
-            </div>
+        <!-- Raw JSON View -->
+        <div v-if="showRawJson" class="rounded-xl bg-card p-4">
+          <div class="mb-2 flex items-center justify-between">
+            <p class="text-sm font-medium text-muted-foreground">Ruwe JSON output</p>
+            <CopyButton :value="rawJsonString" />
           </div>
+          <pre class="overflow-x-auto rounded-lg bg-muted p-4 text-sm text-foreground">{{
+            rawJsonString
+          }}</pre>
+        </div>
 
-          <!-- Vendor & Customer -->
-          <div
-            v-if="result.vendor || result.customer"
-            class="mb-6 grid gap-4 sm:grid-cols-2"
-          >
-            <div
-              v-if="result.vendor?.name"
-              class="rounded-lg border border-slate-200 p-4"
-            >
-              <p class="mb-2 text-sm font-medium text-slate-500">Leverancier</p>
-              <p class="font-medium text-slate-900">{{ result.vendor.name }}</p>
-              <p
-                v-if="result.vendor.address"
-                class="mt-1 text-sm text-slate-600"
-              >
-                {{ result.vendor.address }}
-              </p>
-              <div
-                v-if="result.vendor.email || result.vendor.phone"
-                class="mt-2 space-y-1"
-              >
-                <p v-if="result.vendor.email" class="text-sm text-slate-600">
-                  {{ result.vendor.email }}
-                </p>
-                <p v-if="result.vendor.phone" class="text-sm text-slate-600">
-                  {{ result.vendor.phone }}
-                </p>
-              </div>
-            </div>
-            <div
-              v-if="result.customer?.name"
-              class="rounded-lg border border-slate-200 p-4"
-            >
-              <p class="mb-2 text-sm font-medium text-slate-500">Klant</p>
-              <p class="font-medium text-slate-900">
-                {{ result.customer.name }}
-              </p>
-              <p
-                v-if="result.customer.address"
-                class="mt-1 text-sm text-slate-600"
-              >
-                {{ result.customer.address }}
-              </p>
-            </div>
-          </div>
-
-          <!-- Line Items -->
-          <div v-if="result.items?.length" class="mb-6">
-            <p class="mb-3 text-sm font-medium text-slate-500">Regelitems</p>
-            <div class="overflow-hidden rounded-lg border border-slate-200">
-              <table class="min-w-full divide-y divide-slate-200">
-                <thead class="bg-slate-50">
-                  <tr>
-                    <th
-                      class="px-4 py-3 text-left text-xs font-medium text-slate-500"
-                    >
-                      Omschrijving
-                    </th>
-                    <th
-                      class="px-4 py-3 text-right text-xs font-medium text-slate-500"
-                    >
-                      Aantal
-                    </th>
-                    <th
-                      class="px-4 py-3 text-right text-xs font-medium text-slate-500"
-                    >
-                      Eenheidsprijs
-                    </th>
-                    <th
-                      class="px-4 py-3 text-right text-xs font-medium text-slate-500"
-                    >
-                      Totaal
-                    </th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-slate-200 bg-white">
-                  <tr v-for="(item, index) in result.items" :key="index">
-                    <td class="px-4 py-3 text-sm text-slate-900">
-                      {{ item.description }}
-                    </td>
-                    <td class="px-4 py-3 text-right text-sm text-slate-600">
-                      {{ item.quantity || "-" }}
-                    </td>
-                    <td class="px-4 py-3 text-right text-sm text-slate-600">
-                      {{ formatCurrency(item.unitPrice) }}
-                    </td>
-                    <td
-                      class="px-4 py-3 text-right text-sm font-medium text-slate-900"
-                    >
-                      {{ formatCurrency(item.total) }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <!-- Totals -->
-          <div v-if="result.total" class="mb-6 rounded-lg bg-slate-50 p-4">
-            <div class="flex justify-between text-sm text-slate-600">
-              <span>Subtotaal</span>
-              <span>{{ formatCurrency(result.subtotal) }}</span>
-            </div>
-            <div
-              v-if="result.tax"
-              class="mt-2 flex justify-between text-sm text-slate-600"
-            >
-              <span>BTW</span>
-              <span>{{ formatCurrency(result.tax) }}</span>
-            </div>
-            <div
-              class="mt-2 flex justify-between border-t border-slate-200 pt-2 text-lg font-semibold text-slate-900"
-            >
-              <span>Totaal</span>
-              <span
-                >{{ formatCurrency(result.total) }}
-                {{ result.currency || "" }}</span
-              >
-            </div>
-          </div>
-
-          <!-- Payment Details -->
-          <div
-            v-if="
-              result.paymentDetails?.iban || result.paymentDetails?.bankName
-            "
-            class="mb-6 rounded-lg border border-slate-200 p-4"
-          >
-            <p class="mb-2 text-sm font-medium text-slate-500">
-              Betalingsgegevens
-            </p>
-            <p
-              v-if="result.paymentDetails.bankName"
-              class="text-sm text-slate-900"
-            >
-              {{ result.paymentDetails.bankName }}
-            </p>
-            <p
-              v-if="result.paymentDetails.iban"
-              class="mt-1 font-mono text-sm text-slate-600"
-            >
-              {{ result.paymentDetails.iban }}
-            </p>
-          </div>
-
-          <!-- Additional Information -->
-          <div v-if="result.additionalInfo" class="rounded-lg bg-slate-50 p-4">
-            <p class="mb-2 text-sm font-medium text-slate-500">
-              Aanvullende Informatie
-            </p>
-            <p class="text-sm text-slate-900">{{ result.additionalInfo }}</p>
+        <!-- Extracted Fields -->
+        <div class="rounded-xl bg-card p-6">
+          <h2 class="mb-4 text-xl font-semibold text-card-foreground">Geëxtraheerde Informatie</h2>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <ScanResultField
+              v-for="field in resultFields"
+              :key="field.id"
+              :label="field.label"
+              :name="field.name"
+              :value="field.value"
+              :type="field.type"
+            />
           </div>
         </div>
       </div>
 
       <!-- Error State -->
-      <div v-if="error" class="rounded-2xl bg-red-50 p-6 text-center mt-4">
+      <div v-if="error" class="mt-4 rounded-xl bg-destructive/10 p-6 text-center">
         <div
-          class="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-red-100"
+          class="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-destructive/20"
         >
           <svg
-            class="h-6 w-6 text-red-600"
+            class="h-6 w-6 text-destructive"
             fill="none"
             stroke="currentColor"
             viewBox="0 0 24 24"
@@ -413,14 +396,30 @@ const reset = () => {
             />
           </svg>
         </div>
-        <p class="font-medium text-red-900">{{ error }}</p>
-        <button
-          @click="reset"
-          class="mt-4 text-sm text-red-600 hover:text-red-700"
-        >
+        <p class="font-medium text-destructive">{{ error }}</p>
+        <button @click="reset" class="mt-4 text-sm text-destructive hover:text-destructive/80">
           Probeer opnieuw
         </button>
       </div>
     </div>
+
+    <!-- Template Editor Dialog -->
+    <Dialog v-model:open="showEditorDialog">
+      <DialogContent class="max-h-[90vh] max-w-2xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>
+            {{ editingTemplate ? "Template bewerken" : "Nieuw template maken" }}
+          </DialogTitle>
+          <DialogDescription>
+            Definieer welke velden uit je documenten moeten worden geëxtraheerd
+          </DialogDescription>
+        </DialogHeader>
+        <TemplateEditor
+          :template="editingTemplate"
+          @save="handleSaveTemplate"
+          @cancel="closeEditorDialog"
+        />
+      </DialogContent>
+    </Dialog>
   </div>
 </template>
